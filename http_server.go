@@ -8,39 +8,6 @@ import (
 	"strings"
 )
 
-// Context 请求上下文
-type Context struct {
-	Conn    net.Conn
-	Request *HTTPRequest
-	Writer  *ResponseWriter
-
-	// 路径参数
-	params map[string]string
-
-	// 中间件数据
-	Values   map[string]interface{}
-	Index    int
-	handlers []HandlerFunc
-}
-
-// Param 获取路径参数（类似 gin.Param）
-func (c *Context) Param(key string) string {
-	if c.params == nil {
-		return ""
-	}
-	return c.params[key]
-}
-
-// Params 获取所有路径参数
-func (c *Context) Params() map[string]string {
-	return c.params
-}
-
-// SetParams 设置路径参数（内部使用）
-func (c *Context) SetParams(params map[string]string) {
-	c.params = params
-}
-
 //---------------------------
 
 // HandlerFunc 处理器函数类型
@@ -165,7 +132,7 @@ func (s *HTTPServer) handleConnection(conn net.Conn) {
 		params:  params,
 		Index:   -1,
 	}
-	
+
 	// 执行处理链
 	ctx.handlers = []HandlerFunc{handler}
 	ctx.Next()

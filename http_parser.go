@@ -19,6 +19,8 @@ type HTTPRequest struct {
 	Headers map[string]string
 	Body    []byte
 	Host    string
+	// 添加原始 URL 字符串用于查询参数解析
+	RawURL string
 }
 
 // HTTPResponse 表示 HTTP 响应
@@ -78,11 +80,14 @@ func (p *HTTPParser) parseRequestLine(req *HTTPRequest) error {
 	}
 
 	req.Method = parts[0]
-	req.URL, err = url.Parse(parts[1])
+	req.RawURL = parts[1] // 保存原始 URL
+	req.Proto = parts[2]
+
+	// 解析 URL（包括查询参数）
+	req.URL, err = url.Parse(req.RawURL)
 	if err != nil {
 		return err
 	}
-	req.Proto = parts[2]
 
 	return nil
 }
