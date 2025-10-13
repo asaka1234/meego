@@ -14,11 +14,34 @@ type Context struct {
 	Request *HTTPRequest
 	Writer  *ResponseWriter
 
+	// 路径参数
+	params map[string]string
+
 	// 中间件数据
 	Values   map[string]interface{}
 	Index    int
 	handlers []HandlerFunc
 }
+
+// Param 获取路径参数（类似 gin.Param）
+func (c *Context) Param(key string) string {
+	if c.params == nil {
+		return ""
+	}
+	return c.params[key]
+}
+
+// Params 获取所有路径参数
+func (c *Context) Params() map[string]string {
+	return c.params
+}
+
+// SetParams 设置路径参数（内部使用）
+func (c *Context) SetParams(params map[string]string) {
+	c.params = params
+}
+
+//---------------------------
 
 // HandlerFunc 处理器函数类型
 type HandlerFunc func(*Context)
@@ -126,40 +149,42 @@ func (s *HTTPServer) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// 查找路由并解析路径参数
+	handler, params := s.findRouteHandler(req.Method, req.URL.Path)
+	if handler == nil {
+		s.sendError(conn, 404, "Not Found")
+		return
+	}
+
 	// 创建上下文
 	ctx := &Context{
 		Conn:    conn,
 		Request: req,
 		Writer:  NewResponseWriter(conn),
 		Values:  make(map[string]interface{}),
+		params:  params,
 		Index:   -1,
 	}
-
-	// 查找路由并构建处理链
-	handler := s.findRouteHandler(req.Method, req.URL.Path)
-	if handler == nil {
-		s.sendError(conn, 404, "Not Found")
-		return
-	}
-
+	
 	// 执行处理链
 	ctx.handlers = []HandlerFunc{handler}
 	ctx.Next()
 }
 
-// 查找路由处理器
-func (s *HTTPServer) findRouteHandler(method, path string) HandlerFunc {
-	handler := s.router.FindRoute(method, path)
+// findRouteHandler 更新查找路由方法
+func (s *HTTPServer) findRouteHandler(method, path string) (HandlerFunc, map[string]string) {
+	handler, params := s.router.FindRoute(method, path)
 	if handler == nil {
-		return nil
+		return nil, nil
 	}
 
 	// 应用中间件
 	for i := len(s.middlewares) - 1; i >= 0; i-- {
-		handler = s.middlewares[i](handler)
+		finalHandler := handler
+		handler = s.middlewares[i](finalHandler)
 	}
 
-	return handler
+	return handler, params
 }
 
 // 发送错误响应
@@ -291,33 +316,6 @@ func (w *ResponseWriter) writeResponse(body []byte) error {
 
 	_, err := w.conn.Write([]byte(response.String()))
 	return err
-}
-
-// Router 实现
-type Router struct {
-	routes map[string]map[string]HandlerFunc // method -> path -> handler
-}
-
-func NewRouter() *Router {
-	return &Router{
-		routes: make(map[string]map[string]HandlerFunc),
-	}
-}
-
-func (r *Router) AddRoute(method, path string, handler HandlerFunc) {
-	if r.routes[method] == nil {
-		r.routes[method] = make(map[string]HandlerFunc)
-	}
-	r.routes[method][path] = handler
-}
-
-func (r *Router) FindRoute(method, path string) HandlerFunc {
-	if methods, ok := r.routes[method]; ok {
-		if handler, ok := methods[path]; ok {
-			return handler
-		}
-	}
-	return nil
 }
 
 // 工具函数

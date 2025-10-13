@@ -1,6 +1,7 @@
 package meego
 
 import (
+	"github.com/spf13/cast"
 	"os"
 	"os/signal"
 	"syscall"
@@ -50,7 +51,10 @@ func getUsers(c *Context) {
 
 func getUser(c *Context) {
 	// 实际应该从数据库查询
-	user := User{ID: 1, Name: "Alice", Email: "alice@example.com"}
+	id := c.Param("id")
+	id2 := cast.ToInt(id)
+	
+	user := User{ID: id2, Name: "Alice", Email: "alice@example.com"}
 	c.JSON(200, JSON{"user": user})
 }
 
