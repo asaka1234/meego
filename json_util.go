@@ -1,5 +1,5 @@
 // json_utils.go
-package main
+package meego
 
 import (
 	"encoding/json"

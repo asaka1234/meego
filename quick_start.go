@@ -1,5 +1,5 @@
 // quick_start.go
-package main
+package meego
 
 // 快速启动函数
 func Start(addr ...string) *HTTPServer {

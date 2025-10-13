@@ -1,4 +1,4 @@
-package main
+package meego
 
 // 定义数据模型
 type User struct {

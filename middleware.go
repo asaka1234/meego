@@ -1,5 +1,5 @@
 // middleware.go
-package main
+package meego
 
 import (
 	"fmt"
