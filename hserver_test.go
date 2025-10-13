@@ -47,7 +47,7 @@ func getUsers(c *Context) {
 		{ID: 1, Name: "Alice", Email: "alice@example.com"},
 		{ID: 2, Name: "Bob", Email: "bob@example.com"},
 	}
-	c.JSON(200, JSON{"users": users})
+	c.JSON(StatusOK, JSON{"users": users})
 }
 
 func getUser(c *Context) {
@@ -59,31 +59,31 @@ func getUser(c *Context) {
 	fmt.Printf("====>%s\n", dd)
 
 	user := User{ID: id2, Name: "Alice", Email: "alice@example.com"}
-	c.JSON(200, JSON{"user": user})
+	c.JSON(StatusOK, JSON{"user": user})
 }
 
 func createUser(c *Context) {
 	var user User
 	if err := c.BindJSON(&user); err != nil {
-		c.JSON(400, JSON{"error": err.Error()})
+		c.JSON(StatusBadRequest, JSON{"error": err.Error()})
 		return
 	}
 
 	// 实际应该保存到数据库
 	user.ID = 3
-	c.JSON(201, JSON{"user": user})
+	c.JSON(StatusOK, JSON{"user": user})
 }
 
 func updateUser(c *Context) {
 	var user User
 	if err := c.BindJSON(&user); err != nil {
-		c.JSON(400, JSON{"error": err.Error()})
+		c.JSON(StatusBadRequest, JSON{"error": err.Error()})
 		return
 	}
 
-	c.JSON(200, JSON{"user": user, "message": "User updated"})
+	c.JSON(StatusOK, JSON{"user": user, "message": "User updated"})
 }
 
 func deleteUser(c *Context) {
-	c.JSON(200, JSON{"message": "User deleted"})
+	c.JSON(StatusOK, JSON{"message": "User deleted"})
 }
