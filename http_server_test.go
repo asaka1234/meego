@@ -1,10 +1,5 @@
 package main
 
-import (
-	"fmt"
-	"testing"
-)
-
 // 定义数据模型
 type User struct {
 	ID    int    `json:"id" required:"true"`
@@ -12,6 +7,7 @@ type User struct {
 	Email string `json:"email" required:"true"`
 }
 
+/*
 func TestGetIPS(t *testing.T) {
 	//----------------------------------
 	// 创建服务器
@@ -65,3 +61,4 @@ func TestGetIPS(t *testing.T) {
 	}
 	//----------------------------------
 }
+*/

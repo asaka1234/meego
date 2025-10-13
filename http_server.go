@@ -33,6 +33,47 @@ type HTTPServer struct {
 	middlewares []MiddlewareFunc
 }
 
+// New 创建新的 HTTPServer 实例（类似 gin.New()）
+func New() *HTTPServer {
+	return &HTTPServer{
+		router:      NewRouter(),
+		middlewares: []MiddlewareFunc{},
+	}
+}
+
+// Default 创建带有默认中间件的 HTTPServer（类似 gin.Default()）
+func Default() *HTTPServer {
+	server := New()
+	server.Use(Logger())
+	server.Use(Recovery())
+	return server
+}
+
+// Run 启动服务器（类似 gin.Run()）
+func (s *HTTPServer) Run(addr ...string) error {
+	if len(addr) > 0 {
+		s.addr = addr[0]
+	}
+	if s.addr == "" {
+		s.addr = ":8080" // 默认端口
+	}
+
+	return s.Start()
+}
+
+// Listen 启动服务器（类似 gin.Listen()）
+func (s *HTTPServer) Listen(addr string) error {
+	s.addr = addr
+	return s.Start()
+}
+
+// ListenAndServe 兼容 net/http 风格
+func (s *HTTPServer) ListenAndServe(addr string) error {
+	return s.Listen(addr)
+}
+
+//--------------------------------------------------
+
 // ResponseWriter 响应写入器
 type ResponseWriter struct {
 	conn   net.Conn
