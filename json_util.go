@@ -2,8 +2,8 @@
 package meego
 
 import (
-	"encoding/json"
 	"fmt"
+	"github.com/json-iterator/go"
 	"reflect"
 )
 
@@ -13,6 +13,7 @@ func (c *Context) BindJSON(v interface{}) error {
 		return fmt.Errorf("empty request body")
 	}
 
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal(c.Request.Body, v); err != nil {
 		return fmt.Errorf("invalid JSON: %v", err)
 	}

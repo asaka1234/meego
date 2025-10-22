@@ -1,8 +1,8 @@
 package meego
 
 import (
-	"encoding/json"
 	"fmt"
+	"github.com/json-iterator/go"
 	"net"
 	"strconv"
 	"strings"
@@ -69,6 +69,7 @@ type ResponseWriter struct {
 	conn   net.Conn
 	header map[string]string
 	status int
+	json   jsoniter.API //序列化/反序列化
 }
 
 // JSON 响应结构
@@ -219,6 +220,7 @@ func NewResponseWriter(conn net.Conn) *ResponseWriter {
 		conn:   conn,
 		header: make(map[string]string),
 		status: 200,
+		json:   jsoniter.ConfigCompatibleWithStandardLibrary,
 	}
 }
 
@@ -236,7 +238,7 @@ func (w *ResponseWriter) Status(code int) *ResponseWriter {
 }
 
 func (w *ResponseWriter) JSON(data interface{}) error {
-	jsonData, err := json.Marshal(data)
+	jsonData, err := w.json.Marshal(data)
 	if err != nil {
 		return err
 	}
