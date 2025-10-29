@@ -23,12 +23,43 @@ type HTTPRequest struct {
 	RawURL string
 }
 
+// GetHeader returns value from request headers.
+func (c *HTTPRequest) GetHeader(key string) string {
+	if _, ok := c.Headers[key]; ok {
+		return c.Headers[key]
+	}
+	return ""
+}
+
+func (c *HTTPRequest) ContentType() string {
+	return filterFlags(c.GetHeader("Content-Type"))
+}
+
+func filterFlags(content string) string {
+	for i, char := range content {
+		if char == ' ' || char == ';' {
+			return content[:i]
+		}
+	}
+	return content
+}
+
+//-----------------------------
+
 // HTTPResponse 表示 HTTP 响应
 type HTTPResponse struct {
 	StatusCode int
 	StatusText string
 	Headers    map[string]string
 	Body       []byte
+}
+
+// GetHeader returns value from request headers.
+func (c *HTTPResponse) GetHeader(key string) string {
+	if _, ok := c.Headers[key]; ok {
+		return c.Headers[key]
+	}
+	return ""
 }
 
 //---------------------------------------
