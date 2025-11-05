@@ -9,6 +9,13 @@ import (
 	"testing"
 )
 
+// 定义数据模型
+type User struct {
+	ID    int    `json:"id" required:"true"`
+	Name  string `json:"name" required:"true"`
+	Email string `json:"email" required:"true"`
+}
+
 func Test2(t *testing.T) {
 	// 创建服务器实例
 	app := New()

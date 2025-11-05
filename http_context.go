@@ -21,6 +21,34 @@ type Context struct {
 	handlers []HandlerFunc
 }
 
+// Context 方法
+func (c *Context) Next() {
+	c.Index++
+	if c.Index < len(c.handlers) {
+		c.handlers[c.Index](c)
+	}
+}
+
+func (c *Context) JSON(code int, data interface{}) {
+	c.Writer.Status(code).JSON(data)
+}
+
+func (c *Context) String(code int, text string) {
+	c.Writer.Status(code).String(text)
+}
+
+func (c *Context) HTML(code int, html string) {
+	c.Writer.Status(code).HTML(html)
+}
+
+func (c *Context) Set(key string, value interface{}) {
+	c.Values[key] = value
+}
+
+func (c *Context) Get(key string) interface{} {
+	return c.Values[key]
+}
+
 // Param 获取路径参数（类似 gin.Param）
 func (c *Context) Param(key string) string {
 	if c.params == nil {
