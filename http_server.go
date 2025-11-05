@@ -59,6 +59,7 @@ type HTTPServer struct {
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 	mu           sync.RWMutex
+	wg           sync.WaitGroup // 添加等待组
 }
 
 // New 创建新的 HTTPServer 实例
@@ -123,6 +124,7 @@ func (s *HTTPServer) Start() error {
 
 	// 启动 worker 池
 	for i := 0; i < s.workerCount; i++ {
+		s.wg.Add(1)
 		go s.connectionWorker()
 	}
 
@@ -138,7 +140,13 @@ func (s *HTTPServer) Start() error {
 					time.Sleep(5 * time.Millisecond)
 					continue
 				}
-				return err
+				// 检查是否是因为关闭导致的错误
+				select {
+				case <-s.stopChan:
+					return nil
+				default:
+					return err
+				}
 			}
 
 			// 优化连接参数
@@ -149,10 +157,15 @@ func (s *HTTPServer) Start() error {
 			}
 
 			select {
+			case <-s.stopChan:
+				conn.Close()
+				return nil
 			case s.connChan <- conn:
+				// 成功发送到连接通道
 			default:
 				// 连接池满，直接关闭
 				conn.Close()
+				fmt.Println("Connection pool full, rejecting connection")
 			}
 		}
 	}
@@ -160,12 +173,19 @@ func (s *HTTPServer) Start() error {
 
 // 连接处理 worker
 func (s *HTTPServer) connectionWorker() {
+	defer s.wg.Done()
+
 	for {
 		select {
 		case <-s.stopChan:
 			return
-		case conn := <-s.connChan:
-			s.handleConnectionFast(conn)
+		case conn, ok := <-s.connChan:
+			if !ok {
+				return // 通道已关闭
+			}
+			if conn != nil {
+				s.handleConnectionFast(conn)
+			}
 		}
 	}
 }
@@ -176,13 +196,23 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 		if r := recover(); r != nil {
 			// 静默处理 panic
 		}
-		conn.Close()
+		//conn.Close()
+		// 注意：这里不关闭连接，由请求处理循环控制
 	}()
 
+	// 为每个连接创建新的解析器
 	parser := NewHTTPParser(conn)
 
 	// 支持 keep-alive 连接
 	for {
+		// 检查服务器是否已关闭
+		select {
+		case <-s.stopChan:
+			conn.Close()
+			return
+		default:
+		}
+
 		// 设置读取超时
 		conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 
@@ -192,6 +222,8 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 			if err != io.EOF {
 				s.sendErrorFast(conn, 400, "Bad Request")
 			}
+			// 其他错误，发送错误响应后关闭连接
+			s.sendErrorFast(conn, 400, "Bad Request")
 			break
 		}
 
@@ -206,6 +238,8 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 			break
 		}
 	}
+	// 循环结束后关闭连接
+	conn.Close()
 }
 
 // 优化的请求处理方法
@@ -226,8 +260,19 @@ func (s *HTTPServer) processRequestFast(conn net.Conn, req *HTTPRequest) {
 
 	// 确保在函数返回时释放对象
 	defer func() {
-		contextPool.Put(ctx)
-		responseWriterPool.Put(writer)
+		if r := recover(); r != nil {
+			fmt.Printf("Recovered from panic in request processing: %v\n", r)
+		}
+
+		// 重置并放回对象池
+		if ctx != nil {
+			ctx.reset()
+			contextPool.Put(ctx)
+		}
+		if writer != nil {
+			writer.reset()
+			responseWriterPool.Put(writer)
+		}
 	}()
 
 	// 快速初始化
@@ -263,8 +308,18 @@ func (s *HTTPServer) findRouteHandler(method, path string) (HandlerFunc, map[str
 
 // 优化的错误发送方法
 func (s *HTTPServer) sendErrorFast(conn net.Conn, code int, message string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Recovered from panic in error sending: %v\n", r)
+		}
+	}()
 	writer := responseWriterPool.Get().(*ResponseWriter)
-	defer responseWriterPool.Put(writer)
+	defer func() {
+		if writer != nil {
+			writer.reset()
+			responseWriterPool.Put(writer)
+		}
+	}()
 
 	writer.fastInit(conn)
 	writer.Status(code).JSON(JSON{
@@ -281,7 +336,33 @@ func (s *HTTPServer) shouldClose(req *HTTPRequest) bool {
 
 // 关闭服务器
 func (s *HTTPServer) Shutdown() {
-	close(s.stopChan)
+	select {
+	case <-s.stopChan:
+		// 已经关闭
+	default:
+		close(s.stopChan)
+
+		// 清空连接通道中的连接并关闭它们
+		go func() {
+			for {
+				select {
+				case conn, ok := <-s.connChan:
+					if !ok {
+						return
+					}
+					if conn != nil {
+						conn.Close()
+					}
+				default:
+					return
+				}
+			}
+		}()
+
+		// 等待所有 worker 完成
+		s.wg.Wait()
+		fmt.Println("Server shutdown completed")
+	}
 }
 
 // 添加全局中间件

@@ -216,6 +216,22 @@ func (c *Context) ClientIP() string {
 	return c.Conn.RemoteAddr().String()
 }
 
+// Context 的 reset 方法
+func (c *Context) reset() {
+	c.Conn = nil
+	c.Request = nil
+	c.Writer = nil
+	c.params = nil
+	c.handlers = nil
+	c.Index = -1
+
+	if c.Values != nil {
+		for k := range c.Values {
+			delete(c.Values, k)
+		}
+	}
+}
+
 //-------------------------------------------
 
 // 错误定义
