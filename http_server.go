@@ -3,6 +3,7 @@ package meego
 import (
 	"fmt"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/panjf2000/ants/v2"
 	"io"
 	"net"
 	"sync"
@@ -52,24 +53,27 @@ type HTTPServer struct {
 	router      *Router
 	middlewares []MiddlewareFunc
 
-	// 性能优化字段
-	connChan     chan net.Conn
-	stopChan     chan struct{}
-	workerCount  int
+	pool         *ants.Pool
 	readTimeout  time.Duration
 	writeTimeout time.Duration
-	mu           sync.RWMutex
-	wg           sync.WaitGroup // 添加等待组
+	// 性能优化字段
+	stopChan chan struct{}
+	mu       sync.RWMutex
 }
 
 // New 创建新的 HTTPServer 实例
 func New() *HTTPServer {
+	// 创建协程池，大小根据需求调整
+	pool, err := ants.NewPool(1000, ants.WithExpiryDuration(10*time.Second))
+	if err != nil {
+		panic(err)
+	}
+
 	return &HTTPServer{
 		router:       NewRouter(),
 		middlewares:  []MiddlewareFunc{},
-		connChan:     make(chan net.Conn, 1024),
+		pool:         pool,
 		stopChan:     make(chan struct{}),
-		workerCount:  256, // 根据 CPU 核心数调整
 		readTimeout:  30 * time.Second,
 		writeTimeout: 30 * time.Second,
 	}
@@ -122,12 +126,6 @@ func (s *HTTPServer) Start() error {
 
 	fmt.Printf("HTTPServer started on %s\n", s.addr)
 
-	// 启动 worker 池
-	for i := 0; i < s.workerCount; i++ {
-		s.wg.Add(1)
-		go s.connectionWorker()
-	}
-
 	// 主接受循环
 	for {
 		select {
@@ -140,13 +138,7 @@ func (s *HTTPServer) Start() error {
 					time.Sleep(5 * time.Millisecond)
 					continue
 				}
-				// 检查是否是因为关闭导致的错误
-				select {
-				case <-s.stopChan:
-					return nil
-				default:
-					return err
-				}
+				return err
 			}
 
 			// 优化连接参数
@@ -156,35 +148,14 @@ func (s *HTTPServer) Start() error {
 				tc.SetKeepAlivePeriod(3 * time.Minute)
 			}
 
-			select {
-			case <-s.stopChan:
-				conn.Close()
-				return nil
-			case s.connChan <- conn:
-				// 成功发送到连接通道
-			default:
-				// 连接池满，直接关闭
-				conn.Close()
-				fmt.Println("Connection pool full, rejecting connection")
-			}
-		}
-	}
-}
-
-// 连接处理 worker
-func (s *HTTPServer) connectionWorker() {
-	defer s.wg.Done()
-
-	for {
-		select {
-		case <-s.stopChan:
-			return
-		case conn, ok := <-s.connChan:
-			if !ok {
-				return // 通道已关闭
-			}
-			if conn != nil {
+			// 使用协程池处理连接
+			err = s.pool.Submit(func() {
 				s.handleConnectionFast(conn)
+			})
+			if err != nil {
+				// 协程池已满，直接关闭连接
+				fmt.Printf("Pool is full, rejecting connection: %v\n", err)
+				conn.Close()
 			}
 		}
 	}
@@ -197,7 +168,6 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 			// 静默处理 panic
 		}
 		//conn.Close()
-		// 注意：这里不关闭连接，由请求处理循环控制
 	}()
 
 	// 为每个连接创建新的解析器
@@ -338,30 +308,10 @@ func (s *HTTPServer) shouldClose(req *HTTPRequest) bool {
 func (s *HTTPServer) Shutdown() {
 	select {
 	case <-s.stopChan:
-		// 已经关闭
+		return
 	default:
 		close(s.stopChan)
-
-		// 清空连接通道中的连接并关闭它们
-		go func() {
-			for {
-				select {
-				case conn, ok := <-s.connChan:
-					if !ok {
-						return
-					}
-					if conn != nil {
-						conn.Close()
-					}
-				default:
-					return
-				}
-			}
-		}()
-
-		// 等待所有 worker 完成
-		s.wg.Wait()
-		fmt.Println("Server shutdown completed")
+		s.pool.Release()
 	}
 }
 
@@ -393,10 +343,6 @@ func (s *HTTPServer) DELETE(path string, handler HandlerFunc) {
 func (s *HTTPServer) SetTimeout(readTimeout, writeTimeout time.Duration) {
 	s.readTimeout = readTimeout
 	s.writeTimeout = writeTimeout
-}
-
-func (s *HTTPServer) SetWorkerCount(count int) {
-	s.workerCount = count
 }
 
 // 路由组支持
