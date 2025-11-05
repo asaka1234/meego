@@ -2,7 +2,11 @@ package meego
 
 import (
 	"fmt"
+	jsoniter "github.com/json-iterator/go"
+	"io"
 	"net"
+	"sync"
+	"time"
 )
 
 //---------------------------
@@ -13,22 +17,64 @@ type HandlerFunc func(*Context)
 // MiddlewareFunc 中间件函数类型
 type MiddlewareFunc func(HandlerFunc) HandlerFunc
 
-// HTTPServer HTTP服务器
+// JSON 响应结构
+type JSON map[string]interface{}
+
+//--------------------------------------------
+
+// 全局对象池
+var (
+	contextPool        sync.Pool
+	responseWriterPool sync.Pool
+)
+
+func init() {
+	contextPool = sync.Pool{
+		New: func() interface{} {
+			return &Context{
+				Values: make(map[string]interface{}, 8),
+			}
+		},
+	}
+	responseWriterPool = sync.Pool{
+		New: func() interface{} {
+			return &ResponseWriter{
+				header: make(map[string]string, 16),
+				json:   jsoniter.ConfigCompatibleWithStandardLibrary,
+			}
+		},
+	}
+}
+
+// HTTPServer HTTP服务器 - 优化版本
 type HTTPServer struct {
 	addr        string
 	router      *Router
 	middlewares []MiddlewareFunc
+
+	// 性能优化字段
+	connChan     chan net.Conn
+	stopChan     chan struct{}
+	workerCount  int
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	mu           sync.RWMutex
 }
 
-// New 创建新的 HTTPServer 实例（类似 gin.New()）
+// New 创建新的 HTTPServer 实例
 func New() *HTTPServer {
 	return &HTTPServer{
-		router:      NewRouter(),
-		middlewares: []MiddlewareFunc{},
+		router:       NewRouter(),
+		middlewares:  []MiddlewareFunc{},
+		connChan:     make(chan net.Conn, 1024),
+		stopChan:     make(chan struct{}),
+		workerCount:  256, // 根据 CPU 核心数调整
+		readTimeout:  30 * time.Second,
+		writeTimeout: 30 * time.Second,
 	}
 }
 
-// Default 创建带有默认中间件的 HTTPServer（类似 gin.Default()）
+// Default 创建带有默认中间件的 HTTPServer
 func Default() *HTTPServer {
 	server := New()
 	server.Use(Logger())
@@ -36,19 +82,18 @@ func Default() *HTTPServer {
 	return server
 }
 
-// Run 启动服务器（类似 gin.Run()）
+// Run 启动服务器
 func (s *HTTPServer) Run(addr ...string) error {
 	if len(addr) > 0 {
 		s.addr = addr[0]
 	}
 	if s.addr == "" {
-		s.addr = ":8080" // 默认端口
+		s.addr = ":8080"
 	}
-
 	return s.Start()
 }
 
-// Listen 启动服务器（类似 gin.Listen()）
+// Listen 启动服务器
 func (s *HTTPServer) Listen(addr string) error {
 	s.addr = addr
 	return s.Start()
@@ -59,21 +104,14 @@ func (s *HTTPServer) ListenAndServe(addr string) error {
 	return s.Listen(addr)
 }
 
-//--------------------------------------------------
-
-// JSON 响应结构
-type JSON map[string]interface{}
-
 // 创建新的 HTTPServer
 func NewHTTPServer(addr string) *HTTPServer {
-	return &HTTPServer{
-		addr:        addr,
-		router:      NewRouter(),
-		middlewares: []MiddlewareFunc{},
-	}
+	server := New()
+	server.addr = addr
+	return server
 }
 
-// 启动服务器
+// 优化的启动方法
 func (s *HTTPServer) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -83,82 +121,177 @@ func (s *HTTPServer) Start() error {
 
 	fmt.Printf("HTTPServer started on %s\n", s.addr)
 
+	// 启动 worker 池
+	for i := 0; i < s.workerCount; i++ {
+		go s.connectionWorker()
+	}
+
+	// 主接受循环
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			fmt.Printf("Accept error: %v\n", err)
-			continue
+		select {
+		case <-s.stopChan:
+			return nil
+		default:
+			conn, err := ln.Accept()
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Temporary() {
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
+				return err
+			}
+
+			// 优化连接参数
+			if tc, ok := conn.(*net.TCPConn); ok {
+				tc.SetNoDelay(true)
+				tc.SetKeepAlive(true)
+				tc.SetKeepAlivePeriod(3 * time.Minute)
+			}
+
+			select {
+			case s.connChan <- conn:
+			default:
+				// 连接池满，直接关闭
+				conn.Close()
+			}
 		}
-		go s.handleConnection(conn)
 	}
 }
 
-// 处理连接
-func (s *HTTPServer) handleConnection(conn net.Conn) {
-	defer conn.Close()
-
-	// 解析 HTTP 请求
-	parser := NewHTTPParser(conn)
-	req, err := parser.ParseRequest()
-	if err != nil {
-		fmt.Printf("Parse error: %v\n", err)
-		s.sendError(conn, 400, "Bad Request")
-		return
+// 连接处理 worker
+func (s *HTTPServer) connectionWorker() {
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case conn := <-s.connChan:
+			s.handleConnectionFast(conn)
+		}
 	}
+}
 
-	// 查找路由并解析路径参数
+// 优化的连接处理方法
+func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			// 静默处理 panic
+		}
+		conn.Close()
+	}()
+
+	parser := NewHTTPParser(conn)
+
+	// 支持 keep-alive 连接
+	for {
+		// 设置读取超时
+		conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+
+		// 使用对象池获取请求
+		req, err := parser.ParseRequest()
+		if err != nil {
+			if err != io.EOF {
+				s.sendErrorFast(conn, 400, "Bad Request")
+			}
+			break
+		}
+
+		// 处理请求
+		s.processRequestFast(conn, req)
+
+		// 释放请求对象
+		ReleaseRequest(req)
+
+		// 检查是否保持连接
+		if s.shouldClose(req) {
+			break
+		}
+	}
+}
+
+// 优化的请求处理方法
+func (s *HTTPServer) processRequestFast(conn net.Conn, req *HTTPRequest) {
+	// 设置写入超时
+	conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+
+	// 快速路由查找
 	handler, params := s.findRouteHandler(req.Method, req.URL.Path)
 	if handler == nil {
-		s.sendError(conn, 404, "Not Found")
+		s.sendErrorFast(conn, 404, "Not Found")
 		return
 	}
 
-	// 创建上下文
-	ctx := &Context{
-		Conn:    conn,
-		Request: req,
-		Writer:  NewResponseWriter(conn),
-		Values:  make(map[string]interface{}),
-		params:  params,
-		Index:   -1,
-	}
+	// 从对象池获取上下文和响应写入器
+	ctx := contextPool.Get().(*Context)
+	writer := responseWriterPool.Get().(*ResponseWriter)
+
+	// 确保在函数返回时释放对象
+	defer func() {
+		contextPool.Put(ctx)
+		responseWriterPool.Put(writer)
+	}()
+
+	// 快速初始化
+	ctx.fastInit(conn, req, writer, params, handler)
+	writer.fastInit(conn)
 
 	// 执行处理链
-	ctx.handlers = []HandlerFunc{handler}
 	ctx.Next()
 }
 
-// findRouteHandler 更新查找路由方法
+// 优化的路由查找方法
 func (s *HTTPServer) findRouteHandler(method, path string) (HandlerFunc, map[string]string) {
 	handler, params := s.router.FindRoute(method, path)
 	if handler == nil {
 		return nil, nil
 	}
 
-	// 应用中间件
-	for i := len(s.middlewares) - 1; i >= 0; i-- {
-		finalHandler := handler
-		handler = s.middlewares[i](finalHandler)
+	// 应用中间件（优化：避免在每次请求时创建闭包）
+	s.mu.RLock()
+	middlewares := s.middlewares
+	s.mu.RUnlock()
+
+	if len(middlewares) > 0 {
+		wrappedHandler := handler
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			wrappedHandler = middlewares[i](wrappedHandler)
+		}
+		return wrappedHandler, params
 	}
 
 	return handler, params
 }
 
-// 发送错误响应
-func (s *HTTPServer) sendError(conn net.Conn, code int, message string) {
-	writer := NewResponseWriter(conn)
+// 优化的错误发送方法
+func (s *HTTPServer) sendErrorFast(conn net.Conn, code int, message string) {
+	writer := responseWriterPool.Get().(*ResponseWriter)
+	defer responseWriterPool.Put(writer)
+
+	writer.fastInit(conn)
 	writer.Status(code).JSON(JSON{
 		"error": message,
 		"code":  code,
 	})
 }
 
+// 检查连接是否应该关闭
+func (s *HTTPServer) shouldClose(req *HTTPRequest) bool {
+	connection := req.GetHeader("Connection")
+	return connection == "close"
+}
+
+// 关闭服务器
+func (s *HTTPServer) Shutdown() {
+	close(s.stopChan)
+}
+
 // 添加全局中间件
 func (s *HTTPServer) Use(middleware MiddlewareFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.middlewares = append(s.middlewares, middleware)
 }
 
-// 注册路由
+// 注册路由 - 线程安全版本
 func (s *HTTPServer) GET(path string, handler HandlerFunc) {
 	s.router.AddRoute("GET", path, handler)
 }
@@ -175,7 +308,15 @@ func (s *HTTPServer) DELETE(path string, handler HandlerFunc) {
 	s.router.AddRoute("DELETE", path, handler)
 }
 
-//------------------------------------------
+// 配置方法
+func (s *HTTPServer) SetTimeout(readTimeout, writeTimeout time.Duration) {
+	s.readTimeout = readTimeout
+	s.writeTimeout = writeTimeout
+}
+
+func (s *HTTPServer) SetWorkerCount(count int) {
+	s.workerCount = count
+}
 
 // 路由组支持
 func (s *HTTPServer) Group(prefix string, middlewares ...MiddlewareFunc) *RouteGroup {
@@ -192,20 +333,40 @@ type RouteGroup struct {
 	middlewares []MiddlewareFunc
 }
 
+// 预编译中间件链
+func (g *RouteGroup) wrapHandler(handler HandlerFunc) HandlerFunc {
+	if len(g.middlewares) == 0 {
+		return handler
+	}
+
+	wrapped := handler
+	for i := len(g.middlewares) - 1; i >= 0; i-- {
+		wrapped = g.middlewares[i](wrapped)
+	}
+	return wrapped
+}
+
 func (g *RouteGroup) GET(path string, handler HandlerFunc) {
 	fullPath := g.prefix + path
-	wrappedHandler := handler
-	for i := len(g.middlewares) - 1; i >= 0; i-- {
-		wrappedHandler = g.middlewares[i](wrappedHandler)
-	}
+	wrappedHandler := g.wrapHandler(handler)
 	g.server.GET(fullPath, wrappedHandler)
 }
 
 func (g *RouteGroup) POST(path string, handler HandlerFunc) {
 	fullPath := g.prefix + path
-	wrappedHandler := handler
-	for i := len(g.middlewares) - 1; i >= 0; i-- {
-		wrappedHandler = g.middlewares[i](wrappedHandler)
-	}
+	wrappedHandler := g.wrapHandler(handler)
 	g.server.POST(fullPath, wrappedHandler)
+}
+
+// 添加其他方法
+func (g *RouteGroup) PUT(path string, handler HandlerFunc) {
+	fullPath := g.prefix + path
+	wrappedHandler := g.wrapHandler(handler)
+	g.server.PUT(fullPath, wrappedHandler)
+}
+
+func (g *RouteGroup) DELETE(path string, handler HandlerFunc) {
+	fullPath := g.prefix + path
+	wrappedHandler := g.wrapHandler(handler)
+	g.server.DELETE(fullPath, wrappedHandler)
 }

@@ -21,6 +21,27 @@ type Context struct {
 	handlers []HandlerFunc
 }
 
+// 快速初始化
+func (c *Context) fastInit(conn net.Conn, req *HTTPRequest, writer *ResponseWriter, params map[string]string, handler HandlerFunc) {
+	c.Conn = conn
+	c.Request = req
+	c.Writer = writer
+	c.params = params
+	c.Index = -1
+
+	// 重用 handlers 切片
+	if cap(c.handlers) == 0 {
+		c.handlers = make([]HandlerFunc, 0, 4)
+	}
+	c.handlers = c.handlers[:0]
+	c.handlers = append(c.handlers, handler)
+
+	// 清空 Values 但保留容量
+	for k := range c.Values {
+		delete(c.Values, k)
+	}
+}
+
 // Context 方法
 func (c *Context) Next() {
 	c.Index++
@@ -189,6 +210,13 @@ func (c *Context) GetAllQuery() url.Values {
 	}
 	return c.Request.URL.Query()
 }
+
+func (c *Context) ClientIP() string {
+	// 简化实现，实际应该从 X-Forwarded-For 等头部获取
+	return c.Conn.RemoteAddr().String()
+}
+
+//-------------------------------------------
 
 // 错误定义
 var ErrQueryParamNotFound = &QueryError{Message: "query parameter not found"}
