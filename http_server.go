@@ -1,6 +1,7 @@
 package meego
 
 import (
+	"context"
 	"fmt"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/ants/v2"
@@ -53,12 +54,14 @@ type HTTPServer struct {
 	router      *Router
 	middlewares []MiddlewareFunc
 
-	pool         *ants.Pool
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+
+	pool *ants.Pool
 	// 性能优化字段
-	stopChan chan struct{}
-	mu       sync.RWMutex
+	mu         sync.RWMutex
+	serverCtx  context.Context
+	cancelFunc context.CancelFunc
 }
 
 // New 创建新的 HTTPServer 实例
@@ -69,13 +72,17 @@ func New() *HTTPServer {
 		panic(err)
 	}
 
+	// 创建可取消的上下文
+	ctx, cancel := context.WithCancel(context.Background())
+
 	return &HTTPServer{
 		router:       NewRouter(),
 		middlewares:  []MiddlewareFunc{},
 		pool:         pool,
-		stopChan:     make(chan struct{}),
 		readTimeout:  30 * time.Second,
 		writeTimeout: 30 * time.Second,
+		serverCtx:    ctx,
+		cancelFunc:   cancel,
 	}
 }
 
@@ -129,16 +136,24 @@ func (s *HTTPServer) Start() error {
 	// 主接受循环
 	for {
 		select {
-		case <-s.stopChan:
+		case <-s.serverCtx.Done():
+			fmt.Println("Server received shutdown signal")
 			return nil
 		default:
+			fmt.Printf("=Start default==============\n")
 			conn, err := ln.Accept()
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Temporary() {
 					time.Sleep(5 * time.Millisecond)
 					continue
 				}
-				return err
+				// 检查是否因为上下文取消导致的错误
+				select {
+				case <-s.serverCtx.Done():
+					return nil
+				default:
+					return err
+				}
 			}
 
 			// 优化连接参数
@@ -177,7 +192,9 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 	for {
 		// 检查服务器是否已关闭
 		select {
-		case <-s.stopChan:
+		case <-s.serverCtx.Done():
+			// 已经关闭
+			fmt.Printf("=Start default==============\n")
 			conn.Close()
 			return
 		default:
@@ -306,11 +323,14 @@ func (s *HTTPServer) shouldClose(req *HTTPRequest) bool {
 
 // 关闭服务器
 func (s *HTTPServer) Shutdown() {
+	fmt.Printf("=Shutdown==============\n")
+
 	select {
-	case <-s.stopChan:
+	case <-s.serverCtx.Done():
+		// 已经关闭
 		return
 	default:
-		close(s.stopChan)
+		s.cancelFunc() // 取消上下文
 		s.pool.Release()
 	}
 }
