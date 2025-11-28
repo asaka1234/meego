@@ -16,12 +16,11 @@ import (
 var requestPool = sync.Pool{
 	New: func() interface{} {
 		return &HTTPRequest{
-			Headers: make(map[string]string, 16), // 预分配容量
+			Headers: make(map[string]string, 16),
 		}
 	},
 }
 
-// HTTPRequest 表示解析后的 HTTP 请求
 type HTTPRequest struct {
 	Method  string
 	URL     *url.URL
@@ -29,13 +28,12 @@ type HTTPRequest struct {
 	Headers map[string]string
 	Body    []byte
 	Host    string
-	// 添加原始 URL 字符串用于查询参数解析
-	RawURL string
-	// 内部重用字段
+	RawURL  string
+
 	contentLength int
+	parsed        bool
 }
 
-// 重置方法用于对象池
 func (r *HTTPRequest) reset() {
 	r.Method = ""
 	r.URL = nil
@@ -43,49 +41,35 @@ func (r *HTTPRequest) reset() {
 	r.Host = ""
 	r.RawURL = ""
 	r.contentLength = 0
-
-	// 重用 Body slice，但重置长度
+	r.parsed = false
 	r.Body = r.Body[:0]
 
-	// 清空 Headers 但保留 map 容量
 	for k := range r.Headers {
 		delete(r.Headers, k)
 	}
 }
 
-// 便捷方法
-func (r *HTTPRequest) Query() string {
-	if r.URL != nil {
-		return r.URL.RawQuery
+// 获取内容长度（带缓存）
+func (r *HTTPRequest) ContentLength() int {
+	if r.contentLength > 0 {
+		return r.contentLength
 	}
-	return ""
+
+	if clStr := r.GetHeader("Content-Length"); clStr != "" {
+		if cl, err := strconv.Atoi(clStr); err == nil && cl >= 0 {
+			r.contentLength = cl
+			return cl
+		}
+	}
+	return 0
 }
 
-func (r *HTTPRequest) Path() string {
-	if r.URL != nil {
-		return r.URL.Path
-	}
-	return ""
+func (r *HTTPRequest) GetHeader(key string) string {
+	return r.Headers[key]
 }
 
-// 批量获取查询参数（避免多次解析）
-func (r *HTTPRequest) QueryParams() url.Values {
-	if r.URL != nil {
-		return r.URL.Query()
-	}
-	return url.Values{}
-}
-
-// GetHeader returns value from request headers.
-func (c *HTTPRequest) GetHeader(key string) string {
-	if _, ok := c.Headers[key]; ok {
-		return c.Headers[key]
-	}
-	return ""
-}
-
-func (c *HTTPRequest) ContentType() string {
-	return filterFlags(c.GetHeader("Content-Type"))
+func (r *HTTPRequest) ContentType() string {
+	return filterFlags(r.GetHeader("Content-Type"))
 }
 
 func filterFlags(content string) string {
@@ -97,42 +81,25 @@ func filterFlags(content string) string {
 	return content
 }
 
-// 获取内容长度（缓存版本）
-func (c *HTTPRequest) ContentLength() int {
-	if c.contentLength > 0 {
-		return c.contentLength
-	}
-
-	if clStr := c.GetHeader("Content-Length"); clStr != "" {
-		if cl, err := strconv.Atoi(clStr); err == nil {
-			c.contentLength = cl
-			return cl
-		}
-	}
-	return 0
-}
-
-// 释放请求对象
 func ReleaseRequest(req *HTTPRequest) {
 	if req != nil {
+		req.reset()
 		requestPool.Put(req)
 	}
 }
 
-//---------------------------------------
-
-// 完整的 HTTP 解析器
+// HTTPParser 修复版本
 type HTTPParser struct {
 	reader      *bufio.Reader
-	lineBuffer  []byte // 重用行缓冲区
-	chunkBuffer []byte // 重用分块缓冲区
+	lineBuffer  []byte
+	chunkBuffer []byte
 }
 
 func NewHTTPParser(conn net.Conn) *HTTPParser {
 	return &HTTPParser{
 		reader:      bufio.NewReader(conn),
-		lineBuffer:  make([]byte, 0, 4096), // 预分配 4KB
-		chunkBuffer: make([]byte, 0, 8192), // 预分配 8KB
+		lineBuffer:  make([]byte, 0, 4096),
+		chunkBuffer: make([]byte, 0, 8192),
 	}
 }
 
@@ -140,34 +107,28 @@ func (p *HTTPParser) ParseRequest() (*HTTPRequest, error) {
 	req := requestPool.Get().(*HTTPRequest)
 
 	if err := p.parseRequestInto(req); err != nil {
-		requestPool.Put(req)
+		ReleaseRequest(req) // 使用 ReleaseRequest 确保正确释放
 		return nil, err
 	}
 
+	req.parsed = true
 	return req, nil
 }
 
-// ParseRequestInto 解析到现有对象
-func (p *HTTPParser) ParseRequestInto(req *HTTPRequest) error {
-	req.reset()
-	return p.parseRequestInto(req)
-}
-
-// 核心解析方法
 func (p *HTTPParser) parseRequestInto(req *HTTPRequest) error {
 	// 解析请求行
 	if err := p.parseRequestLineFast(req); err != nil {
-		return err
+		return fmt.Errorf("request line error: %v", err)
 	}
 
 	// 解析头部
 	if err := p.parseHeadersFast(req); err != nil {
-		return err
+		return fmt.Errorf("headers error: %v", err)
 	}
 
 	// 解析请求体
 	if err := p.parseBodyFast(req); err != nil {
-		return err
+		return fmt.Errorf("body error: %v", err)
 	}
 
 	return nil
@@ -179,34 +140,69 @@ func (p *HTTPParser) parseRequestLineFast(req *HTTPRequest) error {
 		return err
 	}
 
-	// 手动分割，避免 strings.Split 分配
-	// 格式: METHOD URL PROTO
-	firstSpace := bytes.IndexByte(line, ' ')
-	if firstSpace == -1 {
-		return fmt.Errorf("invalid request line")
+	fmt.Printf("DEBUG Request line: %q\n", string(line))
+
+	// 更健壮的请求行解析
+	parts := bytes.Split(line, []byte{' '})
+	if len(parts) < 2 {
+		return fmt.Errorf("malformed request line: %q", string(line))
 	}
 
-	secondSpace := bytes.IndexByte(line[firstSpace+1:], ' ')
-	if secondSpace == -1 {
-		return fmt.Errorf("invalid request line")
+	req.Method = string(parts[0])
+
+	// 验证方法
+	if !isValidMethod(req.Method) {
+		return fmt.Errorf("invalid HTTP method: %s", req.Method)
 	}
-	secondSpace += firstSpace + 1
 
-	req.Method = string(line[:firstSpace])
-	req.RawURL = string(line[firstSpace+1 : secondSpace])
-	req.Proto = string(line[secondSpace+1:])
+	req.RawURL = string(parts[1])
 
-	// 解析 URL
+	// 处理协议
+	if len(parts) >= 3 {
+		req.Proto = string(parts[2])
+	} else {
+		req.Proto = "HTTP/1.1" // 默认
+	}
+
+	// 解析 URL - 更宽松的处理
+	if req.RawURL == "" {
+		req.RawURL = "/" // 默认路径
+	}
+
+	// 如果 URL 不包含协议，确保它以 / 开头
+	if !strings.Contains(req.RawURL, "://") && req.RawURL[0] != '/' {
+		req.RawURL = "/" + req.RawURL
+	}
+
 	parsedURL, err := url.Parse(req.RawURL)
 	if err != nil {
-		return err
+		// 尝试 URL 编码处理
+		encodedURL := url.QueryEscape(req.RawURL)
+		if parsedURL, err = url.Parse(encodedURL); err != nil {
+			return fmt.Errorf("failed to parse URL %q: %v", req.RawURL, err)
+		}
 	}
 	req.URL = parsedURL
 
+	fmt.Printf("DEBUG Parsed: %s %s %s\n", req.Method, req.RawURL, req.Proto)
 	return nil
 }
 
-// 快速读取行 - 重用缓冲区
+func isValidMethod(method string) bool {
+	switch method {
+	case "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE":
+		return true
+	default:
+		// 也允许小写方法
+		upperMethod := strings.ToUpper(method)
+		switch upperMethod {
+		case "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE":
+			return true
+		}
+		return false
+	}
+}
+
 func (p *HTTPParser) readLineFast() ([]byte, error) {
 	p.lineBuffer = p.lineBuffer[:0]
 
@@ -223,13 +219,23 @@ func (p *HTTPParser) readLineFast() ([]byte, error) {
 		}
 	}
 
+	// 清理 CRLF
+	if len(p.lineBuffer) > 0 && p.lineBuffer[len(p.lineBuffer)-1] == '\r' {
+		p.lineBuffer = p.lineBuffer[:len(p.lineBuffer)-1]
+	}
+
 	return p.lineBuffer, nil
 }
 
 func (p *HTTPParser) parseHeadersFast(req *HTTPRequest) error {
+	headerCount := 0
+
 	for {
 		line, err := p.readLineFast()
 		if err != nil {
+			if err == io.EOF && headerCount > 0 {
+				break // 允许 EOF 作为头部结束
+			}
 			return err
 		}
 
@@ -239,71 +245,76 @@ func (p *HTTPParser) parseHeadersFast(req *HTTPRequest) error {
 		}
 
 		idx := bytes.IndexByte(line, ':')
-		if idx == -1 {
-			continue // 跳过无效头部
+		if idx <= 0 { // 确保 key 不为空
+			fmt.Printf("WARNING: Skipping malformed header: %q\n", string(line))
+			continue
 		}
 
-		// 使用字节操作避免字符串分配
 		key := strings.TrimSpace(string(line[:idx]))
 		value := strings.TrimSpace(string(line[idx+1:]))
 
+		// 存储头部
 		req.Headers[key] = value
 
-		// 特殊处理 Host 头
+		// 特殊处理
 		if key == "Host" {
 			req.Host = value
 		}
+
+		headerCount++
 	}
+
+	fmt.Printf("DEBUG Parsed %d headers\n", headerCount)
 	return nil
 }
 
 func (p *HTTPParser) parseBodyFast(req *HTTPRequest) error {
-	// 检查 Content-Length
-	if clStr := req.GetHeader("Content-Length"); clStr != "" {
-		contentLength, err := strconv.Atoi(clStr)
-		if err != nil {
-			return err
+	contentLength := req.ContentLength()
+
+	if contentLength > 0 {
+		// 检查大小限制
+		if contentLength > 10*1024*1024 { // 10MB
+			return fmt.Errorf("body too large: %d bytes", contentLength)
 		}
 
-		if contentLength > 0 {
-			// 重用 Body slice
-			if cap(req.Body) < contentLength {
-				req.Body = make([]byte, contentLength)
-			} else {
-				req.Body = req.Body[:contentLength]
-			}
-
-			_, err := io.ReadFull(p.reader, req.Body)
-			if err != nil {
-				return err
-			}
-			req.contentLength = contentLength
+		// 分配或重用 body
+		if cap(req.Body) < contentLength {
+			req.Body = make([]byte, contentLength)
+		} else {
+			req.Body = req.Body[:contentLength]
 		}
-		return nil
-	}
 
-	// 处理 Transfer-Encoding: chunked
-	if te := req.GetHeader("Transfer-Encoding"); te != "" && strings.Contains(te, "chunked") {
+		// 读取 body
+		if _, err := io.ReadFull(p.reader, req.Body); err != nil {
+			return fmt.Errorf("failed to read body: %v", err)
+		}
+
+		fmt.Printf("DEBUG Read body: %d bytes\n", contentLength)
+	} else if te := req.GetHeader("Transfer-Encoding"); te != "" && strings.Contains(strings.ToLower(te), "chunked") {
+		fmt.Println("DEBUG Processing chunked encoding")
 		return p.parseChunkedBodyFast(req)
+	} else {
+		fmt.Println("DEBUG No body to read")
 	}
 
 	return nil
 }
 
 func (p *HTTPParser) parseChunkedBodyFast(req *HTTPRequest) error {
-	// 重用 chunkBuffer
 	p.chunkBuffer = p.chunkBuffer[:0]
+	totalRead := 0
 
 	for {
-		// 读取块大小
+		// 读取块大小行
 		line, err := p.readLineFast()
 		if err != nil {
 			return err
 		}
 
+		// 解析块大小
 		chunkSize, err := strconv.ParseInt(string(line), 16, 64)
 		if err != nil {
-			return err
+			return fmt.Errorf("invalid chunk size: %q", string(line))
 		}
 
 		if chunkSize == 0 {
@@ -320,10 +331,15 @@ func (p *HTTPParser) parseChunkedBodyFast(req *HTTPRequest) error {
 			break
 		}
 
-		// 确保 chunkBuffer 有足够容量
+		totalRead += int(chunkSize)
+		if totalRead > 10*1024*1024 {
+			return fmt.Errorf("chunked body too large: %d bytes", totalRead)
+		}
+
+		// 确保容量
 		if cap(p.chunkBuffer) < len(p.chunkBuffer)+int(chunkSize) {
-			// 需要扩容
-			newBuffer := make([]byte, len(p.chunkBuffer), (len(p.chunkBuffer)+int(chunkSize))*2)
+			newCap := (len(p.chunkBuffer) + int(chunkSize)) * 2
+			newBuffer := make([]byte, len(p.chunkBuffer), newCap)
 			copy(newBuffer, p.chunkBuffer)
 			p.chunkBuffer = newBuffer
 		}
@@ -332,8 +348,7 @@ func (p *HTTPParser) parseChunkedBodyFast(req *HTTPRequest) error {
 		p.chunkBuffer = p.chunkBuffer[:oldLen+int(chunkSize)]
 
 		// 读取块数据
-		_, err = io.ReadFull(p.reader, p.chunkBuffer[oldLen:])
-		if err != nil {
+		if _, err := io.ReadFull(p.reader, p.chunkBuffer[oldLen:]); err != nil {
 			return err
 		}
 
@@ -343,9 +358,9 @@ func (p *HTTPParser) parseChunkedBodyFast(req *HTTPRequest) error {
 		}
 	}
 
-	// 设置 body
 	req.Body = append(req.Body[:0], p.chunkBuffer...)
 	req.contentLength = len(req.Body)
+	fmt.Printf("DEBUG Chunked body: %d bytes\n", len(req.Body))
 
 	return nil
 }

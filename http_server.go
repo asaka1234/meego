@@ -181,6 +181,7 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
 			// 静默处理 panic
+			fmt.Printf("PANIC in handleConnectionFast: %v\n", r)
 		}
 		//conn.Close()
 	}()
@@ -206,11 +207,13 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 		// 使用对象池获取请求
 		req, err := parser.ParseRequest()
 		if err != nil {
+			fmt.Printf("ParseRequest failed: %v, error type: %T\n", err, err)
+
 			if err != io.EOF {
-				s.sendErrorFast(conn, 400, "Bad Request")
+				fmt.Println("Client closed connection (EOF)")
 			}
 			// 其他错误，发送错误响应后关闭连接
-			s.sendErrorFast(conn, 400, "Bad Request")
+			s.sendErrorFast(conn, 400, fmt.Sprintf("Bad Request: %v", err))
 			break
 		}
 
