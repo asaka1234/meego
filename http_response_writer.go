@@ -104,9 +104,8 @@ func (w *ResponseWriter) writeResponse(body []byte) error {
 	if w.header["Content-Length"] == "" {
 		w.header["Content-Length"] = strconv.Itoa(len(body))
 	}
-	if w.header["Connection"] == "" {
-		w.header["Connection"] = "keep-alive"
-	}
+	// 设置 Connection: close
+	w.header["Connection"] = "close"
 
 	// 写入头部
 	for key, value := range w.header {

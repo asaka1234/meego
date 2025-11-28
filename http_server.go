@@ -7,6 +7,7 @@ import (
 	"github.com/panjf2000/ants/v2"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -67,7 +68,7 @@ type HTTPServer struct {
 // New 创建新的 HTTPServer 实例
 func New() *HTTPServer {
 	// 创建协程池，大小根据需求调整
-	pool, err := ants.NewPool(1000, ants.WithExpiryDuration(10*time.Second))
+	pool, err := ants.NewPool(5000, ants.WithExpiryDuration(30*time.Second))
 	if err != nil {
 		panic(err)
 	}
@@ -79,8 +80,8 @@ func New() *HTTPServer {
 		router:       NewRouter(),
 		middlewares:  []MiddlewareFunc{},
 		pool:         pool,
-		readTimeout:  30 * time.Second,
-		writeTimeout: 30 * time.Second,
+		readTimeout:  10 * time.Second,
+		writeTimeout: 10 * time.Second,
 		serverCtx:    ctx,
 		cancelFunc:   cancel,
 	}
@@ -178,7 +179,19 @@ func (s *HTTPServer) Start() error {
 
 // 优化的连接处理方法
 func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
+	// 对于短连接，可以禁用 Nagle 算法以减少延迟
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		// 不需要设置 KeepAlive，因为马上就会关闭
+	}
+	
+	remoteAddr := conn.RemoteAddr().String()
+	fmt.Printf("DEBUG [%s] Connection established\n", remoteAddr)
+
 	defer func() {
+		conn.Close()
+		fmt.Printf("DEBUG [%s] Connection closed\n", remoteAddr)
+
 		if r := recover(); r != nil {
 			// 静默处理 panic
 			fmt.Printf("PANIC in handleConnectionFast: %v\n", r)
@@ -189,57 +202,55 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 	// 为每个连接创建新的解析器
 	parser := NewHTTPParser(conn)
 
-	// 支持 keep-alive 连接
-	for {
-		// 检查服务器是否已关闭
-		select {
-		case <-s.serverCtx.Done():
-			// 已经关闭
-			fmt.Printf("=Start default==============\n")
-			conn.Close()
-			return
-		default:
-		}
+	// 只处理一个请求，然后立即关闭连接
+	conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 
-		// 设置读取超时
-		conn.SetReadDeadline(time.Now().Add(s.readTimeout))
+	fmt.Printf("DEBUG [%s] Waiting for request...\n", remoteAddr)
+	// 使用对象池获取请求
+	req, err := parser.ParseRequest()
+	if err != nil {
+		s.handleParseError(conn, remoteAddr, err)
+		return // 直接返回，defer 会关闭连接
+	}
 
-		// 使用对象池获取请求
-		req, err := parser.ParseRequest()
-		if err != nil {
-			fmt.Printf("ParseRequest failed: %v, error type: %T\n", err, err)
+	fmt.Printf("DEBUG [%s] Processing: %s %s\n", remoteAddr, req.Method, req.RawURL)
+	s.processRequestFast(conn, req)
+	ReleaseRequest(req)
 
-			if err != io.EOF {
-				fmt.Println("Client closed connection (EOF)")
-			}
-			// 其他错误，发送错误响应后关闭连接
-			s.sendErrorFast(conn, 400, fmt.Sprintf("Bad Request: %v", err))
-			break
-		}
+	// 处理完一个请求就直接结束，连接会在 defer 中关闭
+	fmt.Printf("DEBUG [%s] Request processed, closing connection\n", remoteAddr)
+}
 
-		// 处理请求
-		s.processRequestFast(conn, req)
-
-		// 释放请求对象
-		ReleaseRequest(req)
-
-		// 检查是否保持连接
-		if s.shouldClose(req) {
-			break
+func (s *HTTPServer) handleParseError(conn net.Conn, remoteAddr string, err error) {
+	switch {
+	case err == io.EOF:
+		fmt.Printf("DEBUG [%s] Client closed connection\n", remoteAddr)
+	case isTimeoutError(err):
+		fmt.Printf("DEBUG [%s] Read timeout (no data sent)\n", remoteAddr)
+	default:
+		fmt.Printf("DEBUG [%s] Parse error: %v\n", remoteAddr, err)
+		if isParseError(err) {
+			s.sendErrorFast(conn, 400, "Bad Request")
 		}
 	}
-	// 循环结束后关闭连接
-	conn.Close()
+	// 错误处理完后，连接会在 defer 中自动关闭
 }
 
 // 优化的请求处理方法
 func (s *HTTPServer) processRequestFast(conn net.Conn, req *HTTPRequest) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("PANIC in processRequestFast: %v\n", r)
+			s.sendErrorFast(conn, 500, "Internal Server Error")
+		}
+	}()
 	// 设置写入超时
 	conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 
 	// 快速路由查找
 	handler, params := s.findRouteHandler(req.Method, req.URL.Path)
 	if handler == nil {
+		fmt.Printf("No handler found for %s %s\n", req.Method, req.URL.Path)
 		s.sendErrorFast(conn, 404, "Not Found")
 		return
 	}
@@ -268,6 +279,8 @@ func (s *HTTPServer) processRequestFast(conn net.Conn, req *HTTPRequest) {
 	// 快速初始化
 	ctx.fastInit(conn, req, writer, params, handler)
 	writer.fastInit(conn)
+	// 强制短连接
+	writer.SetHeader("Connection", "close")
 
 	// 执行处理链
 	ctx.Next()
@@ -311,7 +324,8 @@ func (s *HTTPServer) sendErrorFast(conn net.Conn, code int, message string) {
 		}
 	}()
 
-	writer.fastInit(conn)
+	// 强制短连接
+	writer.SetHeader("Connection", "close")
 	writer.Status(code).JSON(JSON{
 		"error": message,
 		"code":  code,
@@ -419,4 +433,99 @@ func (g *RouteGroup) DELETE(path string, handler HandlerFunc) {
 	fullPath := g.prefix + path
 	wrappedHandler := g.wrapHandler(handler)
 	g.server.DELETE(fullPath, wrappedHandler)
+}
+
+//====
+
+// isTimeoutError 判断是否为超时错误
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// 检查错误字符串
+	errStr := err.Error()
+	timeoutIndicators := []string{
+		"timeout",
+		"i/o timeout",
+		"deadline exceeded",
+		"timed out",
+	}
+
+	for _, indicator := range timeoutIndicators {
+		if strings.Contains(strings.ToLower(errStr), indicator) {
+			return true
+		}
+	}
+
+	// 检查 net.Error 接口
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+
+	return false
+}
+
+// isParseError 判断是否为真正的 HTTP 协议解析错误
+func isParseError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// 这些是真正的 HTTP 协议解析错误，应该返回 400
+	parseErrorIndicators := []string{
+		"invalid request line",
+		"invalid HTTP method",
+		"invalid URL",
+		"malformed request line",
+		"invalid chunk size",
+		"failed to parse",
+		"malformed",
+		"invalid header",
+		"invalid Content-Length",
+		"body too large",
+	}
+
+	for _, indicator := range parseErrorIndicators {
+		if strings.Contains(errStr, indicator) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isConnectionError 判断是否为连接相关错误（不是解析错误）
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if err == io.EOF {
+		return true
+	}
+
+	errStr := err.Error()
+	connectionErrorIndicators := []string{
+		"closed",
+		"reset",
+		"refused",
+		"broken pipe",
+		"connection abort",
+	}
+
+	for _, indicator := range connectionErrorIndicators {
+		if strings.Contains(errStr, indicator) {
+			return true
+		}
+	}
+
+	// 超时错误也是连接问题
+	if isTimeoutError(err) {
+		return true
+	}
+
+	return false
 }
