@@ -342,7 +342,21 @@ func (s *HTTPServer) sendErrorFast(conn net.Conn, code int, message string) {
 			fmt.Printf("Recovered from panic in error sending: %v\n", r)
 		}
 	}()
-	writer := responseWriterPool.Get().(*ResponseWriter)
+	// 从对象池获取响应写入器
+	writerObj := responseWriterPool.Get()
+	if writerObj == nil {
+		// 对象池可能返回nil，需要处理
+		fmt.Printf("Failed to get writer from pool for error response\n")
+		return
+	}
+	writer, ok := writerObj.(*ResponseWriter)
+	if !ok {
+		fmt.Printf("Type assertion failed for writer from pool\n")
+		return
+	}
+	// 关键：必须初始化writer！
+	writer.fastInit(conn)
+
 	defer func() {
 		if writer != nil {
 			writer.reset()
