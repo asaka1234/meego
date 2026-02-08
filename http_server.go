@@ -184,7 +184,7 @@ func (s *HTTPServer) handleConnectionFast(conn net.Conn) {
 		tc.SetNoDelay(true)
 		// 不需要设置 KeepAlive，因为马上就会关闭
 	}
-	
+
 	remoteAddr := conn.RemoteAddr().String()
 	fmt.Printf("DEBUG [%s] Connection established\n", remoteAddr)
 
@@ -243,6 +243,8 @@ func (s *HTTPServer) processRequestFast(conn net.Conn, req *HTTPRequest) {
 			fmt.Printf("PANIC in processRequestFast: %v\n", r)
 			s.sendErrorFast(conn, 500, "Internal Server Error")
 		}
+		// 确保连接关闭
+		conn.Close()
 	}()
 	// 设置写入超时
 	conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
@@ -256,8 +258,8 @@ func (s *HTTPServer) processRequestFast(conn net.Conn, req *HTTPRequest) {
 	}
 
 	// 从对象池获取上下文和响应写入器
-	ctx := contextPool.Get().(*Context)
-	writer := responseWriterPool.Get().(*ResponseWriter)
+	var ctx *Context
+	var writer *ResponseWriter
 
 	// 确保在函数返回时释放对象
 	defer func() {
@@ -275,6 +277,30 @@ func (s *HTTPServer) processRequestFast(conn net.Conn, req *HTTPRequest) {
 			responseWriterPool.Put(writer)
 		}
 	}()
+
+	// 安全地从对象池获取
+	ctxObj := contextPool.Get()
+	writerObj := responseWriterPool.Get()
+
+	var ok bool
+	ctx, ok = ctxObj.(*Context)
+	if !ok || ctx == nil {
+		fmt.Printf("Failed to get context from pool\n")
+		s.sendErrorFast(conn, 500, "Internal Server Error")
+		return
+	}
+
+	writer, ok = writerObj.(*ResponseWriter)
+	if !ok || writer == nil {
+		fmt.Printf("Failed to get writer from pool\n")
+		s.sendErrorFast(conn, 500, "Internal Server Error")
+		// 如果writer获取失败，但ctx已获取，需要放回
+		if ctx != nil {
+			ctx.reset()
+			contextPool.Put(ctx)
+		}
+		return
+	}
 
 	// 快速初始化
 	ctx.fastInit(conn, req, writer, params, handler)
